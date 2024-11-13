@@ -1,589 +1,1275 @@
 import torch
-import torchvision.transforms.functional as F
-import io
+from torch.functional import F
 import os
-import matplotlib
-matplotlib.use('Agg')   
-import matplotlib.pyplot as plt
-import matplotlib.patches as patches
-from PIL import Image, ImageDraw, ImageColor, ImageFont
-import random
 import numpy as np
-import re
-from pathlib import Path
+import json
+import random
 
-#workaround for unnecessary flash_attn requirement
-from unittest.mock import patch
-from transformers.dynamic_module_utils import get_imports
+from tqdm import tqdm
+from contextlib import nullcontext
 
-def fixed_get_imports(filename: str | os.PathLike) -> list[str]:
-    try:
-        if not str(filename).endswith("modeling_florence2.py"):
-            return get_imports(filename)
-        imports = get_imports(filename)
-        imports.remove("flash_attn")
-    except:
-        print(f"No flash_attn import to remove")
-        pass
-    return imports
-
+from .load_model import load_model
 
 import comfy.model_management as mm
-from comfy.utils import ProgressBar
+from comfy.utils import ProgressBar, common_upscale
 import folder_paths
 
 script_directory = os.path.dirname(os.path.abspath(__file__))
 
-from transformers import AutoModelForCausalLM, AutoProcessor, set_seed
 
-class DownloadAndLoadFlorence2Model:
-    @classmethod
-    def INPUT_TYPES(s):
-        return {"required": {
-            "model": (
-                    [ 
-                    'microsoft/Florence-2-base',
-                    'microsoft/Florence-2-base-ft',
-                    'microsoft/Florence-2-large',
-                    'microsoft/Florence-2-large-ft',
-                    'HuggingFaceM4/Florence-2-DocVQA',
-                    'thwri/CogFlorence-2.1-Large',
-                    'thwri/CogFlorence-2.2-Large',
-                    'gokaygokay/Florence-2-SD3-Captioner',
-                    'gokaygokay/Florence-2-Flux-Large',
-                    'MiaoshouAI/Florence-2-base-PromptGen-v1.5',
-                    'MiaoshouAI/Florence-2-large-PromptGen-v1.5',
-                    'MiaoshouAI/Florence-2-base-PromptGen-v2.0',
-                    'MiaoshouAI/Florence-2-large-PromptGen-v2.0'
-                    ],
-                    {
-                    "default": 'microsoft/Florence-2-base'
-                    }),
-            "precision": ([ 'fp16','bf16','fp32'],
-                    {
-                    "default": 'fp16'
-                    }),
-            "attention": (
-                    [ 'flash_attention_2', 'sdpa', 'eager'],
-                    {
-                    "default": 'sdpa'
-                    }),
-            },
-            "optional": {
-                "lora": ("PEFTLORA",),
-            }
-        }
-
-    RETURN_TYPES = ("FL2MODEL",)
-    RETURN_NAMES = ("florence2_model",)
-    FUNCTION = "loadmodel"
-    CATEGORY = "Florence2"
-
-    def loadmodel(self, model, precision, attention, lora=None):
-        device = mm.get_torch_device()
-        offload_device = mm.unet_offload_device()
-        dtype = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}[precision]
-
-        model_name = model.rsplit('/', 1)[-1]
-        model_path = os.path.join(folder_paths.models_dir, "LLM", model_name)
-        
-        if not os.path.exists(model_path):
-            print(f"Downloading Florence2 model to: {model_path}")
-            from huggingface_hub import snapshot_download
-            snapshot_download(repo_id=model,
-                            local_dir=model_path,
-                            local_dir_use_symlinks=False)
-            
-        print(f"using {attention} for attention")
-        with patch("transformers.dynamic_module_utils.get_imports", fixed_get_imports): #workaround for unnecessary flash_attn requirement
-            model = AutoModelForCausalLM.from_pretrained(model_path, attn_implementation=attention, device_map=device, torch_dtype=dtype,trust_remote_code=True)
-        processor = AutoProcessor.from_pretrained(model_path, trust_remote_code=True)
-
-        if lora is not None:
-            from peft import PeftModel
-            adapter_name = lora
-            model = PeftModel.from_pretrained(model, adapter_name, trust_remote_code=True)
-        
-        florence2_model = {
-            'model': model, 
-            'processor': processor,
-            'dtype': dtype
-            }
-
-        return (florence2_model,)
-    
-class DownloadAndLoadFlorence2Lora:
-    @classmethod
-    def INPUT_TYPES(s):
-        return {"required": {
-            "model": (
-                    [ 
-                    'NikshepShetty/Florence-2-pixelprose',
-                    ],
-                  ),            
-            },
-          
-        }
-
-    RETURN_TYPES = ("PEFTLORA",)
-    RETURN_NAMES = ("lora",)
-    FUNCTION = "loadmodel"
-    CATEGORY = "Florence2"
-
-    def loadmodel(self, model):
-        model_name = model.rsplit('/', 1)[-1]
-        model_path = os.path.join(folder_paths.models_dir, "LLM", model_name)
-        
-        if not os.path.exists(model_path):
-            print(f"Downloading Florence2 lora model to: {model_path}")
-            from huggingface_hub import snapshot_download
-            snapshot_download(repo_id=model,
-                            local_dir=model_path,
-                            local_dir_use_symlinks=False)
-        return (model_path,)
-    
-class Florence2ModelLoader:
-
-    @classmethod
-    def INPUT_TYPES(s):
-        return {"required": {
-            "model": ([item.name for item in Path(folder_paths.models_dir, "LLM").iterdir() if item.is_dir()], {"tooltip": "models are expected to be in Comfyui/models/LLM folder"}),
-            "precision": (['fp16','bf16','fp32'],),
-            "attention": (
-                    [ 'flash_attention_2', 'sdpa', 'eager'],
-                    {
-                    "default": 'sdpa'
-                    }),
-            },
-            "optional": {
-                "lora": ("PEFTLORA",),
-            }
-        }
-
-    RETURN_TYPES = ("FL2MODEL",)
-    RETURN_NAMES = ("florence2_model",)
-    FUNCTION = "loadmodel"
-    CATEGORY = "Florence2"
-
-    def loadmodel(self, model, precision, attention, lora=None):
-        device = mm.get_torch_device()
-        dtype = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}[precision]
-        model_path = Path(folder_paths.models_dir, "LLM", model)
-        print(f"Loading model from {model_path}")
-        print(f"using {attention} for attention")
-        with patch("transformers.dynamic_module_utils.get_imports", fixed_get_imports): #workaround for unnecessary flash_attn requirement
-            model = AutoModelForCausalLM.from_pretrained(model_path, attn_implementation=attention, device_map=device, torch_dtype=dtype,trust_remote_code=True)
-        processor = AutoProcessor.from_pretrained(model_path, trust_remote_code=True)
-
-        if lora is not None:
-            from peft import PeftModel
-            adapter_name = lora
-            model = PeftModel.from_pretrained(model, adapter_name, trust_remote_code=True)
-        
-        florence2_model = {
-            'model': model, 
-            'processor': processor,
-            'dtype': dtype
-            }
-   
-        return (florence2_model,)
-    
-class Florence2Run:
+class DownloadAndLoadSAM2Model:
     @classmethod
     def INPUT_TYPES(s):
         return {
             "required": {
-                "image": ("IMAGE", ),
-                "florence2_model": ("FL2MODEL", ),
-                "text_input": ("STRING", {"default": "", "multiline": True}),
-                "task": (
-                    [ 
-                    'region_caption',
-                    'dense_region_caption',
-                    'region_proposal',
-                    'caption',
-                    'detailed_caption',
-                    'more_detailed_caption',
-                    'caption_to_phrase_grounding',
-                    'referring_expression_segmentation',
-                    'ocr',
-                    'ocr_with_region',
-                    'docvqa',
-                    'prompt_gen_tags',
-                    'prompt_gen_mixed_caption',
-                    'prompt_gen_analyze',
-                    'prompt_gen_mixed_caption_plus',
+                "model": (
+                    [
+                        "sam2_hiera_base_plus.safetensors",
+                        "sam2_hiera_large.safetensors",
+                        "sam2_hiera_small.safetensors",
+                        "sam2_hiera_tiny.safetensors",
+                        "sam2.1_hiera_base_plus.safetensors",
+                        "sam2.1_hiera_large.safetensors",
+                        "sam2.1_hiera_small.safetensors",
+                        "sam2.1_hiera_tiny.safetensors",
                     ],
-                   ),
-                "fill_mask": ("BOOLEAN", {"default": True}),
+                ),
+                "segmentor": (["single_image", "video", "automaskgenerator"],),
+                "device": (["cuda", "cpu", "mps"],),
+                "precision": (["fp16", "bf16", "fp32"], {"default": "fp16"}),
             },
-            "optional": {
-                "keep_model_loaded": ("BOOLEAN", {"default": False}),
-                "max_new_tokens": ("INT", {"default": 1024, "min": 1, "max": 4096}),
-                "num_beams": ("INT", {"default": 3, "min": 1, "max": 64}),
-                "do_sample": ("BOOLEAN", {"default": True}),
-                "output_mask_select": ("STRING", {"default": ""}),
-                "seed": ("INT", {"default": 1, "min": 1, "max": 0xffffffffffffffff}),
-            }
         }
-    
-    RETURN_TYPES = ("IMAGE", "MASK", "STRING", "JSON")
-    RETURN_NAMES =("image", "mask", "caption", "data") 
-    FUNCTION = "encode"
-    CATEGORY = "Florence2"
 
-    def hash_seed(self, seed):
-        import hashlib
-        # Convert the seed to a string and then to bytes
-        seed_bytes = str(seed).encode('utf-8')
-        # Create a SHA-256 hash of the seed bytes
-        hash_object = hashlib.sha256(seed_bytes)
-        # Convert the hash to an integer
-        hashed_seed = int(hash_object.hexdigest(), 16)
-        # Ensure the hashed seed is within the acceptable range for set_seed
-        return hashed_seed % (2**32)
+    RETURN_TYPES = ("SAM2MODEL",)
+    RETURN_NAMES = ("sam2_model",)
+    FUNCTION = "loadmodel"
+    CATEGORY = "SAM2"
 
-    def encode(self, image, text_input, florence2_model, task, fill_mask, keep_model_loaded=False, 
-            num_beams=3, max_new_tokens=1024, do_sample=True, output_mask_select="", seed=None):
-        device = mm.get_torch_device()
-        _, height, width, _ = image.shape
-        offload_device = mm.unet_offload_device()
-        annotated_image_tensor = None
-        mask_tensor = None
-        processor = florence2_model['processor']
-        model = florence2_model['model']
-        dtype = florence2_model['dtype']
-        model.to(device)
-        
-        if seed:
-            set_seed(self.hash_seed(seed))
+    def loadmodel(self, model, segmentor, device, precision):
+        if precision != "fp32" and device == "cpu":
+            raise ValueError("fp16 and bf16 are not supported on cpu")
 
-        colormap = ['blue','orange','green','purple','brown','pink','olive','cyan','red',
-                    'lime','indigo','violet','aqua','magenta','gold','tan','skyblue']
+        if device == "cuda":
+            if torch.cuda.get_device_properties(0).major >= 8:
+                # turn on tfloat32 for Ampere GPUs (https://pytorch.org/docs/stable/notes/cuda.html#tensorfloat-32-tf32-on-ampere-devices)
+                torch.backends.cuda.matmul.allow_tf32 = True
+                torch.backends.cudnn.allow_tf32 = True
+        dtype = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}[
+            precision
+        ]
+        device = {
+            "cuda": torch.device("cuda"),
+            "cpu": torch.device("cpu"),
+            "mps": torch.device("mps"),
+        }[device]
 
-        prompts = {
-            'region_caption': '<OD>',
-            'dense_region_caption': '<DENSE_REGION_CAPTION>',
-            'region_proposal': '<REGION_PROPOSAL>',
-            'caption': '<CAPTION>',
-            'detailed_caption': '<DETAILED_CAPTION>',
-            'more_detailed_caption': '<MORE_DETAILED_CAPTION>',
-            'caption_to_phrase_grounding': '<CAPTION_TO_PHRASE_GROUNDING>',
-            'referring_expression_segmentation': '<REFERRING_EXPRESSION_SEGMENTATION>',
-            'ocr': '<OCR>',
-            'ocr_with_region': '<OCR_WITH_REGION>',
-            'docvqa': '<DocVQA>',
-            'prompt_gen_tags': '<GENERATE_TAGS>',
-            'prompt_gen_mixed_caption': '<MIXED_CAPTION>',
-            'prompt_gen_analyze': '<ANALYZE>',
-            'prompt_gen_mixed_caption_plus': '<MIXED_CAPTION_PLUS>',
-        }
-        task_prompt = prompts.get(task, '<OD>')
+        download_path = os.path.join(folder_paths.models_dir, "sam2")
+        if precision != "fp32" and "2.1" in model:
+            base_name, extension = model.rsplit(".", 1)
+            model = f"{base_name}-fp16.{extension}"
+        model_path = os.path.join(download_path, model)
+        print("model_path: ", model_path)
 
-        if (task not in ['referring_expression_segmentation', 'caption_to_phrase_grounding', 'docvqa']) and text_input:
-            raise ValueError("Text input (prompt) is only supported for 'referring_expression_segmentation', 'caption_to_phrase_grounding', and 'docvqa'")
+        if not os.path.exists(model_path):
+            print(f"Downloading SAM2 model to: {model_path}")
+            from huggingface_hub import snapshot_download
 
-        if text_input != "":
-            prompt = task_prompt + " " + text_input
-        else:
-            prompt = task_prompt
-
-        image = image.permute(0, 3, 1, 2)
-        
-        out = []
-        out_masks = []
-        out_results = []
-        out_data = []
-        pbar = ProgressBar(len(image))
-        for img in image:
-            image_pil = F.to_pil_image(img)
-            inputs = processor(text=prompt, images=image_pil, return_tensors="pt", do_rescale=False).to(dtype).to(device)
-
-            generated_ids = model.generate(
-                input_ids=inputs["input_ids"],
-                pixel_values=inputs["pixel_values"],
-                max_new_tokens=max_new_tokens,
-                do_sample=do_sample,
-                num_beams=num_beams,
+            snapshot_download(
+                repo_id="Kijai/sam2-safetensors",
+                allow_patterns=[f"*{model}*"],
+                local_dir=download_path,
+                local_dir_use_symlinks=False,
             )
 
-            results = processor.batch_decode(generated_ids, skip_special_tokens=False)[0]
-            print(results)
-            # cleanup the special tokens from the final list
-            if task == 'ocr_with_region':
-                clean_results = str(results)       
-                cleaned_string = re.sub(r'</?s>|<[^>]*>', '\n',  clean_results)
-                clean_results = re.sub(r'\n+', '\n', cleaned_string)
-            else:
-                clean_results = str(results)       
-                clean_results = clean_results.replace('</s>', '')
-                clean_results = clean_results.replace('<s>', '')
+        model_mapping = {
+            "2.0": {
+                "base": "sam2_hiera_b+.yaml",
+                "large": "sam2_hiera_l.yaml",
+                "small": "sam2_hiera_s.yaml",
+                "tiny": "sam2_hiera_t.yaml",
+            },
+            "2.1": {
+                "base": "sam2.1_hiera_b+.yaml",
+                "large": "sam2.1_hiera_l.yaml",
+                "small": "sam2.1_hiera_s.yaml",
+                "tiny": "sam2.1_hiera_t.yaml",
+            },
+        }
+        version = "2.1" if "2.1" in model else "2.0"
 
-             #return single string if only one image for compatibility with nodes that can't handle string lists
-            if len(image) == 1:
-                out_results = clean_results
-            else:
-                out_results.append(clean_results)
+        model_cfg_path = next(
+            (
+                os.path.join(script_directory, "sam2_configs", cfg)
+                for key, cfg in model_mapping[version].items()
+                if key in model
+            ),
+            None,
+        )
+        print(f"Using model config: {model_cfg_path}")
 
-            W, H = image_pil.size
-            
-            parsed_answer = processor.post_process_generation(results, task=task_prompt, image_size=(W, H))
+        model = load_model(model_path, model_cfg_path, segmentor, dtype, device)
 
-            if task == 'region_caption' or task == 'dense_region_caption' or task == 'caption_to_phrase_grounding' or task == 'region_proposal':           
-                fig, ax = plt.subplots(figsize=(W / 100, H / 100), dpi=100)
-                fig.subplots_adjust(left=0, right=1, top=1, bottom=0)
-                ax.imshow(image_pil)
-                bboxes = parsed_answer[task_prompt]['bboxes']
-                labels = parsed_answer[task_prompt]['labels']
+        sam2_model = {
+            "model": model,
+            "dtype": dtype,
+            "device": device,
+            "segmentor": segmentor,
+            "version": version,
+        }
 
-                mask_indexes = []
-                # Determine mask indexes outside the loop
-                if output_mask_select != "":
-                    mask_indexes = [n for n in output_mask_select.split(",")]
-                    print(mask_indexes)
+        return (sam2_model,)
+
+
+class Florence2toCoordinates:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "data": ("JSON",),
+                "index": ("STRING", {"default": "0"}),
+                "batch": ("BOOLEAN", {"default": False}),
+            },
+        }
+
+    RETURN_TYPES = ("STRING", "BBOX")
+    RETURN_NAMES = ("center_coordinates", "bboxes")
+    FUNCTION = "segment"
+    CATEGORY = "SAM2"
+
+    def segment(self, data, index, batch=False):
+        print(data)
+        try:
+            coordinates = coordinates.replace("'", '"')
+            coordinates = json.loads(coordinates)
+        except:
+            coordinates = data
+        print("Type of data:", type(data))
+        print("Data:", data)
+        if len(data) == 0:
+            return (json.dumps([{"x": 0, "y": 0}]),)
+        center_points = []
+
+        if index.strip():  # Check if index is not empty
+            indexes = [int(i) for i in index.split(",")]
+        else:  # If index is empty, use all indices from data[0]
+            indexes = list(range(len(data[0])))
+
+        print("Indexes:", indexes)
+        bboxes = []
+
+        if batch:
+            for idx in indexes:
+                if 0 <= idx < len(data[0]):
+                    for i in range(len(data)):
+                        bbox = data[i][idx]
+                        min_x, min_y, max_x, max_y = bbox
+                        center_x = int((min_x + max_x) / 2)
+                        center_y = int((min_y + max_y) / 2)
+                        center_points.append({"x": center_x, "y": center_y})
+                        bboxes.append(bbox)
+        else:
+            for idx in indexes:
+                if 0 <= idx < len(data[0]):
+                    bbox = data[0][idx]
+                    min_x, min_y, max_x, max_y = bbox
+                    center_x = int((min_x + max_x) / 2)
+                    center_y = int((min_y + max_y) / 2)
+                    center_points.append({"x": center_x, "y": center_y})
+                    bboxes.append(bbox)
                 else:
-                    mask_indexes = [str(i) for i in range(len(bboxes))]
+                    raise ValueError(f"There's nothing in index: {idx}")
 
-                # Initialize mask_layer only if needed
-                if fill_mask:
-                    mask_layer = Image.new('RGB', image_pil.size, (0, 0, 0))
-                    mask_draw = ImageDraw.Draw(mask_layer)
+        coordinates = json.dumps(center_points)
+        print("Coordinates:", coordinates)
+        return (coordinates, bboxes)
 
-                for index, (bbox, label) in enumerate(zip(bboxes, labels)):
-                    # Modify the label to include the index
-                    indexed_label = f"{index}.{label}"
-                    
-                    if fill_mask:
-                        if str(index) in mask_indexes:
-                            print("match index:", str(index), "in mask_indexes:", mask_indexes)
-                            mask_draw.rectangle([bbox[0], bbox[1], bbox[2], bbox[3]], fill=(255, 255, 255))
-                        if label in mask_indexes:
-                            print("match label")
-                            mask_draw.rectangle([bbox[0], bbox[1], bbox[2], bbox[3]], fill=(255, 255, 255))
 
-                    # Create a Rectangle patch
-                    rect = patches.Rectangle(
-                        (bbox[0], bbox[1]),  # (x,y) - lower left corner
-                        bbox[2] - bbox[0],   # Width
-                        bbox[3] - bbox[1],   # Height
-                        linewidth=1,
-                        edgecolor='r',
-                        facecolor='none',
-                        label=indexed_label
+class Sam2Segmentation:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "sam2_model": ("SAM2MODEL",),
+                "image": ("IMAGE",),
+                "keep_model_loaded": ("BOOLEAN", {"default": True}),
+            },
+            "optional": {
+                "coordinates_positive": ("STRING", {"forceInput": True}),
+                "coordinates_negative": ("STRING", {"forceInput": True}),
+                "bboxes": ("BBOX",),
+                "individual_objects": ("BOOLEAN", {"default": False}),
+                "mask": ("MASK",),
+            },
+        }
+
+    RETURN_TYPES = ("MASK",)
+    RETURN_NAMES = ("mask",)
+    FUNCTION = "segment"
+    CATEGORY = "SAM2"
+
+    def segment(
+        self,
+        image,
+        sam2_model,
+        keep_model_loaded,
+        coordinates_positive=None,
+        coordinates_negative=None,
+        individual_objects=False,
+        bboxes=None,
+        mask=None,
+    ):
+        offload_device = mm.unet_offload_device()
+        model = sam2_model["model"]
+        device = sam2_model["device"]
+        dtype = sam2_model["dtype"]
+        segmentor = sam2_model["segmentor"]
+        B, H, W, C = image.shape
+
+        if mask is not None:
+            input_mask = mask.clone().unsqueeze(1)
+            input_mask = F.interpolate(input_mask, size=(256, 256), mode="bilinear")
+            input_mask = input_mask.squeeze(1)
+
+        if segmentor == "automaskgenerator":
+            raise ValueError("For automaskgenerator use Sam2AutoMaskSegmentation -node")
+        if segmentor == "single_image" and B > 1:
+            print("Segmenting batch of images with single_image segmentor")
+
+        if (
+            segmentor == "video"
+            and bboxes is not None
+            and "2.1" not in sam2_model["version"]
+        ):
+            raise ValueError("2.0 model doesn't support bboxes with video segmentor")
+
+        if segmentor == "video":  # video model needs images resized first thing
+            model_input_image_size = model.image_size
+            print("Resizing to model input image size: ", model_input_image_size)
+            image = common_upscale(
+                image.movedim(-1, 1),
+                model_input_image_size,
+                model_input_image_size,
+                "bilinear",
+                "disabled",
+            ).movedim(1, -1)
+
+        # handle point coordinates
+        if coordinates_positive is not None:
+            try:
+                coordinates_positive = json.loads(
+                    coordinates_positive.replace("'", '"')
+                )
+                coordinates_positive = [
+                    (coord["x"], coord["y"]) for coord in coordinates_positive
+                ]
+                if coordinates_negative is not None:
+                    coordinates_negative = json.loads(
+                        coordinates_negative.replace("'", '"')
                     )
-                     # Calculate text width with a rough estimation
-                    text_width = len(label) * 6  # Adjust multiplier based on your font size
-                    text_height = 12  # Adjust based on your font size
+                    coordinates_negative = [
+                        (coord["x"], coord["y"]) for coord in coordinates_negative
+                    ]
+            except:
+                pass
 
-                    # Initial text position
-                    text_x = bbox[0]
-                    text_y = bbox[1] - text_height  # Position text above the top-left of the bbox
-
-                    # Adjust text_x if text is going off the left or right edge
-                    if text_x < 0:
-                        text_x = 0
-                    elif text_x + text_width > W:
-                        text_x = W - text_width
-
-                    # Adjust text_y if text is going off the top edge
-                    if text_y < 0:
-                        text_y = bbox[3]  # Move text below the bottom-left of the bbox if it doesn't overlap with bbox
-
-                    # Add the rectangle to the plot
-                    ax.add_patch(rect)
-                    facecolor = random.choice(colormap) if len(image) == 1 else 'red'
-                    # Add the label
-                    plt.text(
-                        text_x,
-                        text_y,
-                        indexed_label,
-                        color='white',
-                        fontsize=12,
-                        bbox=dict(facecolor=facecolor, alpha=0.5)
-                    )
-                if fill_mask:             
-                    mask_tensor = F.to_tensor(mask_layer)
-                    mask_tensor = mask_tensor.unsqueeze(0).permute(0, 2, 3, 1).cpu().float()
-                    mask_tensor = mask_tensor.mean(dim=0, keepdim=True)
-                    mask_tensor = mask_tensor.repeat(1, 1, 1, 3)
-                    mask_tensor = mask_tensor[:, :, :, 0]
-                    out_masks.append(mask_tensor)           
-
-                # Remove axis and padding around the image
-                ax.axis('off')
-                ax.margins(0,0)
-                ax.get_xaxis().set_major_locator(plt.NullLocator())
-                ax.get_yaxis().set_major_locator(plt.NullLocator())
-                fig.canvas.draw() 
-                buf = io.BytesIO()
-                plt.savefig(buf, format='png', pad_inches=0)
-                buf.seek(0)
-                annotated_image_pil = Image.open(buf)
-
-                annotated_image_tensor = F.to_tensor(annotated_image_pil)
-                out_tensor = annotated_image_tensor[:3, :, :].unsqueeze(0).permute(0, 2, 3, 1).cpu().float()
-                out.append(out_tensor)
-               
-                out_data.append(bboxes)
-
-                
-                pbar.update(1)
-    
-                plt.close(fig)
-
-            elif task == 'referring_expression_segmentation':
-                # Create a new black image
-                mask_image = Image.new('RGB', (W, H), 'black')
-                mask_draw = ImageDraw.Draw(mask_image)
-  
-                predictions = parsed_answer[task_prompt]
-    
-                # Iterate over polygons and labels  
-                for polygons, label in zip(predictions['polygons'], predictions['labels']):
-                    color = random.choice(colormap)
-                    for _polygon in polygons:  
-                        _polygon = np.array(_polygon).reshape(-1, 2)
-                        # Clamp polygon points to image boundaries
-                        _polygon = np.clip(_polygon, [0, 0], [W - 1, H - 1])
-                        if len(_polygon) < 3:  
-                            print('Invalid polygon:', _polygon)
-                            continue  
-                        
-                        _polygon = _polygon.reshape(-1).tolist()
-                        
-                        # Draw the polygon
-                        if fill_mask:
-                            overlay = Image.new('RGBA', image_pil.size, (255, 255, 255, 0))
-                            image_pil = image_pil.convert('RGBA')
-                            draw = ImageDraw.Draw(overlay)
-                            color_with_opacity = ImageColor.getrgb(color) + (180,)
-                            draw.polygon(_polygon, outline=color, fill=color_with_opacity, width=3)
-                            image_pil = Image.alpha_composite(image_pil, overlay)
-                        else:
-                            draw = ImageDraw.Draw(image_pil)
-                            draw.polygon(_polygon, outline=color, width=3)
-
-                        #draw mask
-                        mask_draw.polygon(_polygon, outline="white", fill="white")
-                        
-                image_tensor = F.to_tensor(image_pil)
-                image_tensor = image_tensor[:3, :, :].unsqueeze(0).permute(0, 2, 3, 1).cpu().float() 
-                out.append(image_tensor)
-
-                mask_tensor = F.to_tensor(mask_image)
-                mask_tensor = mask_tensor.unsqueeze(0).permute(0, 2, 3, 1).cpu().float()
-                mask_tensor = mask_tensor.mean(dim=0, keepdim=True)
-                mask_tensor = mask_tensor.repeat(1, 1, 1, 3)
-                mask_tensor = mask_tensor[:, :, :, 0]
-                out_masks.append(mask_tensor)
-                pbar.update(1)
-
-            elif task == 'ocr_with_region':
-                try:
-                    font = ImageFont.load_default().font_variant(size=24)
-                except:
-                    font = ImageFont.load_default()
-                predictions = parsed_answer[task_prompt]
-                scale = 1
-                image_pil = image_pil.convert('RGBA')
-                overlay = Image.new('RGBA', image_pil.size, (255, 255, 255, 0))
-                draw = ImageDraw.Draw(overlay)
-                bboxes, labels = predictions['quad_boxes'], predictions['labels']
-                
-                # Create a new black image for the mask
-                mask_image = Image.new('RGB', (W, H), 'black')
-                mask_draw = ImageDraw.Draw(mask_image)
-                
-                for box, label in zip(bboxes, labels):
-                    scaled_box = [v / (width if idx % 2 == 0 else height) for idx, v in enumerate(box)]
-                    out_data.append({"label": label, "box": scaled_box})
-                    
-                    color = random.choice(colormap)
-                    new_box = (np.array(box) * scale).tolist()
-                    
-                    if fill_mask:
-                        color_with_opacity = ImageColor.getrgb(color) + (180,)
-                        draw.polygon(new_box, outline=color, fill=color_with_opacity, width=3)
-                    else:
-                        draw.polygon(new_box, outline=color, width=3)
-                    
-                    draw.text((new_box[0]+8, new_box[1]+2),
-                              "{}".format(label),
-                              align="right",
-                              font=font,
-                              fill=color)
-                    
-                    # Draw the mask
-                    mask_draw.polygon(new_box, outline="white", fill="white")
-                
-                image_pil = Image.alpha_composite(image_pil, overlay)
-                image_pil = image_pil.convert('RGB')
-                
-                image_tensor = F.to_tensor(image_pil)
-                image_tensor = image_tensor[:3, :, :].unsqueeze(0).permute(0, 2, 3, 1).cpu().float()
-                out.append(image_tensor)
-
-                # Process the mask
-                mask_tensor = F.to_tensor(mask_image)
-                mask_tensor = mask_tensor.unsqueeze(0).permute(0, 2, 3, 1).cpu().float()
-                mask_tensor = mask_tensor.mean(dim=0, keepdim=True)
-                mask_tensor = mask_tensor.repeat(1, 1, 1, 3)
-                mask_tensor = mask_tensor[:, :, :, 0]
-                out_masks.append(mask_tensor)
-
-                pbar.update(1)
-            
-            elif task == 'docvqa':
-                if text_input == "":
-                    raise ValueError("Text input (prompt) is required for 'docvqa'")
-                prompt = "<DocVQA> " + text_input
-
-                inputs = processor(text=prompt, images=image_pil, return_tensors="pt", do_rescale=False).to(dtype).to(device)
-                generated_ids = model.generate(
-                    input_ids=inputs["input_ids"],
-                    pixel_values=inputs["pixel_values"],
-                    max_new_tokens=max_new_tokens,
-                    do_sample=do_sample,
-                    num_beams=num_beams,
+            if not individual_objects:
+                positive_point_coords = np.atleast_2d(np.array(coordinates_positive))
+            else:
+                positive_point_coords = np.array(
+                    [np.atleast_2d(coord) for coord in coordinates_positive]
                 )
 
-                results = processor.batch_decode(generated_ids, skip_special_tokens=False)[0]
-                clean_results = results.replace('</s>', '').replace('<s>', '')
-                
-                if len(image) == 1:
-                    out_results = clean_results
+            if coordinates_negative is not None:
+                negative_point_coords = np.array(coordinates_negative)
+                # Ensure both positive and negative coords are lists of 2D arrays if individual_objects is True
+                if individual_objects:
+                    assert (
+                        negative_point_coords.shape[0] <= positive_point_coords.shape[0]
+                    ), "Can't have more negative than positive points in individual_objects mode"
+                    if negative_point_coords.ndim == 2:
+                        negative_point_coords = negative_point_coords[:, np.newaxis, :]
+                    # Extend negative coordinates to match the number of positive coordinates
+                    while (
+                        negative_point_coords.shape[0] < positive_point_coords.shape[0]
+                    ):
+                        negative_point_coords = np.concatenate(
+                            (negative_point_coords, negative_point_coords[:1, :, :]),
+                            axis=0,
+                        )
+                    final_coords = np.concatenate(
+                        (positive_point_coords, negative_point_coords), axis=1
+                    )
                 else:
-                    out_results.append(clean_results)
-                    
-                out.append(F.to_tensor(image_pil).unsqueeze(0).permute(0, 2, 3, 1).cpu().float())
+                    final_coords = np.concatenate(
+                        (positive_point_coords, negative_point_coords), axis=0
+                    )
+            else:
+                final_coords = positive_point_coords
 
-                pbar.update(1)
-            
-        if len(out) > 0:
-            out_tensor = torch.cat(out, dim=0)
-        else:
-            out_tensor = torch.zeros((1, 64,64, 3), dtype=torch.float32, device="cpu")
-        if len(out_masks) > 0:
-            out_mask_tensor = torch.cat(out_masks, dim=0)
-        else:
-            out_mask_tensor = torch.zeros((1,64,64), dtype=torch.float32, device="cpu")
+        # Handle possible bboxes
+        if bboxes is not None:
+            boxes_np_batch = []
+            for bbox_list in bboxes:
+                boxes_np = []
+                for bbox in bbox_list:
+                    boxes_np.append(bbox)
+                boxes_np = np.array(boxes_np)
+                boxes_np_batch.append(boxes_np)
+            if individual_objects:
+                final_box = np.array(boxes_np_batch)
+            else:
+                final_box = np.array(boxes_np)
+            final_labels = None
+
+        # handle labels
+        if coordinates_positive is not None:
+            if not individual_objects:
+                positive_point_labels = np.ones(len(positive_point_coords))
+            else:
+                positive_labels = []
+                for point in positive_point_coords:
+                    positive_labels.append(np.array([1]))  # 1)
+                positive_point_labels = np.stack(positive_labels, axis=0)
+
+            if coordinates_negative is not None:
+                if not individual_objects:
+                    negative_point_labels = np.zeros(
+                        len(negative_point_coords)
+                    )  # 0 = negative
+                    final_labels = np.concatenate(
+                        (positive_point_labels, negative_point_labels), axis=0
+                    )
+                else:
+                    negative_labels = []
+                    for point in positive_point_coords:
+                        negative_labels.append(np.array([0]))  # 1)
+                    negative_point_labels = np.stack(negative_labels, axis=0)
+                    # combine labels
+                    final_labels = np.concatenate(
+                        (positive_point_labels, negative_point_labels), axis=1
+                    )
+            else:
+                final_labels = positive_point_labels
+            print("combined labels: ", final_labels)
+            print("combined labels shape: ", final_labels.shape)
+
+        mask_list = []
+        try:
+            model.to(device)
+        except:
+            model.model.to(device)
+
+        autocast_condition = not mm.is_device_mps(device)
+        with (
+            torch.autocast(mm.get_autocast_device(device), dtype=dtype)
+            if autocast_condition
+            else nullcontext()
+        ):
+            if segmentor == "single_image":
+                image_np = (image.contiguous() * 255).byte().numpy()
+                comfy_pbar = ProgressBar(len(image_np))
+                tqdm_pbar = tqdm(total=len(image_np), desc="Processing Images")
+                for i in range(len(image_np)):
+
+                    model.set_image(image_np[i])
+
+                    if bboxes is None:
+                        input_box = None
+                    else:
+                        if len(image_np) > 1:
+                            input_box = final_box[i]
+                        input_box = final_box
+
+                    out_masks, scores, logits = model.predict(
+                        point_coords=(
+                            final_coords if coordinates_positive is not None else None
+                        ),
+                        point_labels=(
+                            final_labels if coordinates_positive is not None else None
+                        ),
+                        box=input_box,
+                        multimask_output=True if not individual_objects else False,
+                        mask_input=(
+                            input_mask[i].unsqueeze(0) if mask is not None else None
+                        ),
+                    )
+
+                    if out_masks.ndim == 3:
+                        sorted_ind = np.argsort(scores)[::-1]
+                        out_masks = out_masks[sorted_ind][
+                            0
+                        ]  # choose only the best result for now
+                        scores = scores[sorted_ind]
+                        logits = logits[sorted_ind]
+                        mask_list.append(np.expand_dims(out_masks, axis=0))
+                    else:
+                        _, _, H, W = out_masks.shape
+                        # Combine masks for all object IDs in the frame
+                        combined_mask = np.zeros((H, W), dtype=bool)
+                        for out_mask in out_masks:
+                            combined_mask = np.logical_or(combined_mask, out_mask)
+                        combined_mask = combined_mask.astype(np.uint8)
+                        mask_list.append(combined_mask)
+
+                    comfy_pbar.update(1)
+                    tqdm_pbar.update(1)
+
+            elif segmentor == "video":
+                mask_list = []
+                if hasattr(self, "inference_state"):
+                    model.reset_state(self.inference_state)
+                self.inference_state = model.init_state(
+                    image.permute(0, 3, 1, 2).contiguous(), H, W, device=device
+                )
+                if bboxes is None:
+                    input_box = None
+                else:
+                    input_box = bboxes[0]
+
+                if individual_objects and bboxes is not None:
+                    raise ValueError("bboxes not supported with individual_objects")
+
+                if individual_objects:
+                    for i, (coord, label) in enumerate(zip(final_coords, final_labels)):
+                        _, out_obj_ids, out_mask_logits = model.add_new_points_or_box(
+                            inference_state=self.inference_state,
+                            frame_idx=0,
+                            obj_id=i,
+                            points=final_coords[i],
+                            labels=final_labels[i],
+                            clear_old_points=True,
+                            box=input_box,
+                        )
+                else:
+                    _, out_obj_ids, out_mask_logits = model.add_new_points_or_box(
+                        inference_state=self.inference_state,
+                        frame_idx=0,
+                        obj_id=1,
+                        points=(
+                            final_coords if coordinates_positive is not None else None
+                        ),
+                        labels=(
+                            final_labels if coordinates_positive is not None else None
+                        ),
+                        clear_old_points=True,
+                        box=input_box,
+                    )
+
+                pbar = ProgressBar(B)
+                video_segments = {}
+                for (
+                    out_frame_idx,
+                    out_obj_ids,
+                    out_mask_logits,
+                ) in model.propagate_in_video(self.inference_state):
+                    video_segments[out_frame_idx] = {
+                        out_obj_id: (out_mask_logits[i] > 0.0).cpu().numpy()
+                        for i, out_obj_id in enumerate(out_obj_ids)
+                    }
+                    pbar.update(1)
+                    if individual_objects:
+                        _, _, H, W = out_mask_logits.shape
+                        # Combine masks for all object IDs in the frame
+                        combined_mask = np.zeros((H, W), dtype=np.uint8)
+                        for i, out_obj_id in enumerate(out_obj_ids):
+                            out_mask = (out_mask_logits[i] > 0.0).cpu().numpy()
+                            combined_mask = np.logical_or(combined_mask, out_mask)
+                        video_segments[out_frame_idx] = combined_mask
+
+                if individual_objects:
+                    for frame_idx, combined_mask in video_segments.items():
+                        mask_list.append(combined_mask)
+                else:
+                    for frame_idx, obj_masks in video_segments.items():
+                        for out_obj_id, out_mask in obj_masks.items():
+                            mask_list.append(out_mask)
 
         if not keep_model_loaded:
-            print("Offloading model...")
+            try:
+                model.to(offload_device)
+            except:
+                model.model.to(offload_device)
+
+        out_list = []
+        for mask in mask_list:
+            mask_tensor = torch.from_numpy(mask)
+            mask_tensor = mask_tensor.permute(1, 2, 0)
+            mask_tensor = mask_tensor[:, :, 0]
+            out_list.append(mask_tensor)
+        mask_tensor = torch.stack(out_list, dim=0).cpu().float()
+        return (mask_tensor,)
+
+
+def bbox_corners_to_yolo(x_min, y_min, x_max, y_max, img_width, img_height):
+    """
+    Convert bounding box from corners format to YOLO format.
+
+    Parameters:
+    x_min, y_min, x_max, y_max (float): Coordinates of the bounding box in corners format.
+    img_width, img_height (int): Dimensions of the image.
+
+    Returns:
+    tuple: Bounding box in YOLO format (x_center, y_center, width, height).
+    """
+    # Calculate the center of the bounding box
+    x_center = (x_min + x_max) / 2.0
+    y_center = (y_min + y_max) / 2.0
+
+    # Calculate the width and height of the bounding box
+    width = x_max - x_min
+    height = y_max - y_min
+
+    # Normalize the coordinates
+    x_center /= img_width
+    y_center /= img_height
+    width /= img_width
+    height /= img_height
+
+    return x_center, y_center, width, height
+
+
+def bbox_yolo_to_corners(x_center, y_center, width, height, img_width, img_height):
+    """
+    Convert bounding box from YOLO format to corners format.
+
+    Parameters:
+    x_center, y_center, width, height (float): Coordinates of the bounding box in YOLO format (normalized).
+    img_width, img_height (int): Dimensions of the image.
+
+    Returns:
+    tuple: Bounding box in corners format (x_min, y_min, x_max, y_max).
+    """
+    # Denormalize the coordinates
+    x_center *= img_width
+    y_center *= img_height
+    width *= img_width
+    height *= img_height
+
+    # Calculate the corners of the bounding box
+    x_min = x_center - (width / 2.0)
+    y_min = y_center - (height / 2.0)
+    x_max = x_center + (width / 2.0)
+    y_max = y_center + (height / 2.0)
+
+    return int(x_min), int(y_min), int(x_max), int(y_max)
+
+
+from PIL import Image
+import random
+import cv2 as cv
+
+
+class Sam2SegmentationSeq:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "sam2_model": ("SAM2MODEL",),
+                "image": ("IMAGE",),
+                "keep_model_loaded": ("BOOLEAN", {"default": True}),
+            },
+            "optional": {
+                "coordinates_positive": ("STRING", {"forceInput": True}),
+                "coordinates_negative": ("STRING", {"forceInput": True}),
+                "bboxes": ("BBOX",),
+                "individual_objects": ("BOOLEAN", {"default": False}),
+                "mask": ("MASK",),
+                "alpha": ("INT", {"default": 0, "min": 0, "max": 100}),
+            },
+        }
+
+    RETURN_TYPES = ("MASK",)
+    RETURN_NAMES = ("mask",)
+    FUNCTION = "segment"
+    CATEGORY = "SAM2"
+
+    def segment(
+        self,
+        image,
+        sam2_model,
+        keep_model_loaded,
+        coordinates_positive=None,
+        coordinates_negative=None,
+        individual_objects=False,
+        bboxes=None,
+        mask=None,
+        alpha=0,
+    ):
+
+        offload_device = mm.unet_offload_device()
+        model = sam2_model["model"]
+        device = sam2_model["device"]
+        dtype = sam2_model["dtype"]
+        segmentor = sam2_model["segmentor"]
+        B, H, W, C = image.shape
+
+        if mask is not None:
+            input_mask = mask.clone().unsqueeze(1)
+            input_mask = F.interpolate(input_mask, size=(256, 256), mode="bilinear")
+            input_mask = input_mask.squeeze(1)
+
+        if segmentor == "automaskgenerator":
+            raise ValueError("For automaskgenerator use Sam2AutoMaskSegmentation -node")
+        if segmentor == "single_image" and B > 1:
+            print("Segmenting batch of images with single_image segmentor")
+
+        if segmentor == "video":
+            raise ValueError("not implemented")
+
+        mask_list = []
+        masks = []
+        batch_masks = []
+        try:
+            model.to(device)
+        except:
+            model.model.to(device)
+
+        autocast_condition = not mm.is_device_mps(device)
+        with (
+            torch.autocast(mm.get_autocast_device(device), dtype=dtype)
+            if autocast_condition
+            else nullcontext()
+        ):
+            if segmentor == "single_image":
+                # <BHWC>
+                image_np = (image.contiguous() * 255).byte().numpy()
+                comfy_pbar = ProgressBar(len(image_np))
+                tqdm_pbar = tqdm(total=len(image_np), desc="Processing Images")
+
+                # para toda imagem:
+                for img_index, img in enumerate(image_np):
+                    width = img.shape[1]
+                    height = img.shape[0]
+                    img_area = width * height
+                    print("shape and area:", img.shape, img_area)
+
+                    print("bboxes:", bboxes)
+
+                    # para toda bounding box:
+                    for bbox_index, bbox in enumerate(bboxes):
+                        x1, y1, x2, y2 = [int(_) for _ in bbox]
+                        bbox_area = (x2 - x1) * (y2 - y1)
+
+                        # converter bbox para formato YOLO
+                        x, y, w, h = bbox_corners_to_yolo(x1, y1, x2, y2, width, height)
+
+                        print("bbox corners", x1, y1, x2, y2)
+                        print("bbox yolo", x, y, w, h)
+                        print("bbox_area", bbox_area)
+
+                        # Definir a area de interesse e o tamanho da imagem usada.
+                        print("bbox_area / image_area", bbox_area / img_area)
+                        if bbox_area / img_area > 0.25:
+                            # manter imagem original
+                            print("Usando a imagem inteira")
+                            img_pos = img
+                            x1_pos, y1_pos, x2_pos, y2_pos = x1, y1, x2, y2
+                            x1_img, y1_img, x2_img, y2_img = 0, 0, width, height
+                        else:
+                            # Recortando em uma dimensão igual a bbox + parte proporcional ao tamanho da imagem
+                            if alpha != 0:
+
+                                print("Expandindo a area de interesse")
+
+                                y1_img = max(
+                                    0,
+                                    y1 - (int(height * (alpha / 100))),
+                                )
+                                y2_img = min(
+                                    height,
+                                    y2 + (int(height * (alpha / 100))),
+                                )
+                                x1_img = max(
+                                    0,
+                                    x1 - (int(width * (alpha / 100))),
+                                )
+                                x2_img = min(
+                                    width,
+                                    x2 + (int(width * (alpha / 100))),
+                                )
+                            else:
+                                y1_img = y1
+                                y2_img = y2
+                                x1_img = x1
+                                x2_img = x2
+
+                            # cortar imagem
+                            img_pos = img[y1_img:y2_img, x1_img:x2_img]
+                            x1_pos = x1 - x1_img
+                            y1_pos = y1 - y1_img
+                            x2_pos = x2 - x1_img
+                            y2_pos = y2 - y1_img
+
+                        # img_pos_width = img_pos.shape[1]
+                        # img_pos_height = img_pos.shape[0]
+                        # x1_pos, y1_pos, x2_pos, y2_pos = bbox_yolo_to_corners(
+                        #     x, y, w, h, img_pos_width, img_pos_height
+                        # )
+                        bbox_pos = [[x1_pos, y1_pos, x2_pos, y2_pos]]
+
+                        # temporariamente salvando as imagens para debug
+                        random_caractere_string = "".join(
+                            random.choices("abcdefghijklmnopqrstuvwxyz", k=5)
+                        )
+
+                        img_pos_temp = img_pos.copy()
+                        img_pos_temp = cv.rectangle(
+                            img_pos_temp,
+                            (x1_pos, y1_pos),
+                            (x2_pos, y2_pos),
+                            (255, 0, 0),
+                            2,
+                        )
+                        Image.fromarray(img_pos_temp).save(
+                            f"/home/vmldev/Imagens/temp/img_pos_{random_caractere_string}_{img_index}_{bbox_index}.png"
+                        )
+                        print(
+                            "bbox_pos:",
+                            bbox_pos,
+                            "img_pos:",
+                            img_pos.shape,
+                        )
+
+                        model.set_image(img_pos)
+
+                        out_masks, scores, logits = model.predict(
+                            point_coords=(None),
+                            point_labels=(None),
+                            box=bbox_pos,
+                            multimask_output=True if not individual_objects else False,
+                            mask_input=(None),
+                        )
+
+                        if out_masks.ndim == 3:
+                            sorted_ind = np.argsort(scores)[::-1]
+                            out_masks = out_masks[sorted_ind][
+                                0
+                            ]  # choose only the best result for now
+                            scores = scores[sorted_ind]
+                            logits = logits[sorted_ind]
+                            mask_list.append(np.expand_dims(out_masks, axis=0))
+                        else:
+                            _, _, H, W = out_masks.shape
+                            # Combine masks for all object IDs in the frame
+                            combined_mask = np.zeros((H, W), dtype=bool)
+                            for out_mask in out_masks:
+                                combined_mask = np.logical_or(combined_mask, out_mask)
+                            combined_mask = combined_mask.astype(np.uint8)
+                            mask_list.append(combined_mask)
+
+                        # convert the mask back to the original image size
+
+                        parcial_mask = np.zeros_like(img)
+                        print(
+                            "parcial_mask:",
+                            parcial_mask.shape,
+                            "mask_list:",
+                            len(mask_list),
+                            "mask_list[-1]:",
+                            mask_list[-1].shape,
+                        )
+
+                        # final_mask: (870, 595, 3) mask_list[-1]: (1, 870, 595)
+                        print(
+                            "stack",
+                            np.stack(
+                                (mask_list[-1][0], mask_list[-1][0], mask_list[-1][0]),
+                                axis=-1,
+                            ).shape,
+                        )
+
+                        parcial_mask[y1_img:y2_img, x1_img:x2_img] = np.stack(
+                            (mask_list[-1][0], mask_list[-1][0], mask_list[-1][0]),
+                            axis=-1,
+                        )
+                        Image.fromarray(parcial_mask * 255).save(
+                            f"/home/vmldev/Imagens/temp/parcial_mask_{random_caractere_string}_{img_index}_{bbox_index}.png"
+                        )
+
+                        masks.append(parcial_mask)
+
+                        comfy_pbar.update(1)
+                        tqdm_pbar.update(1)
+
+                # end para toda imagem.
+                batch_masks.append(masks)
+
+            elif segmentor == "video":
+                raise ValueError("not implemented")
+
+        if not keep_model_loaded:
+            try:
+                model.to(offload_device)
+            except:
+                model.model.to(offload_device)
+
+        out_list = []
+        # final_mask: (870, 595, 3) <HWC>
+        for mask in batch_masks[0]:
+            mask_tensor = torch.from_numpy(mask)
+            # mask_tensor = mask_tensor.permute(1, 2, 0)
+            mask_tensor = mask_tensor[:, :, 0]  # <HW1>
+            out_list.append(mask_tensor)
+
+        # use all masks to create a unique mask
+        mask_tensor = torch.stack(out_list, dim=0).cpu().float()
+
+        # Torch.tensor<BHWC>
+        return (mask_tensor.any(dim=0, keepdim=True),)
+
+
+class Sam2VideoSegmentationAddPoints:
+    @classmethod
+    def IS_CHANGED(s):  # TODO: smarter reset?
+        return ""
+
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "sam2_model": ("SAM2MODEL",),
+                "coordinates_positive": ("STRING", {"forceInput": True}),
+                "frame_index": ("INT", {"default": 0}),
+                "object_index": ("INT", {"default": 0}),
+            },
+            "optional": {
+                "image": ("IMAGE",),
+                "coordinates_negative": ("STRING", {"forceInput": True}),
+                "prev_inference_state": ("SAM2INFERENCESTATE",),
+            },
+        }
+
+    RETURN_TYPES = (
+        "SAM2MODEL",
+        "SAM2INFERENCESTATE",
+    )
+    RETURN_NAMES = (
+        "sam2_model",
+        "inference_state",
+    )
+    FUNCTION = "segment"
+    CATEGORY = "SAM2"
+
+    def segment(
+        self,
+        sam2_model,
+        coordinates_positive,
+        frame_index,
+        object_index,
+        image=None,
+        coordinates_negative=None,
+        prev_inference_state=None,
+    ):
+        offload_device = mm.unet_offload_device()
+        model = sam2_model["model"]
+        device = sam2_model["device"]
+        dtype = sam2_model["dtype"]
+        segmentor = sam2_model["segmentor"]
+
+        if segmentor != "video":
+            raise ValueError("Loaded model is not SAM2Video")
+        if image is not None:
+            B, H, W, C = image.shape
+            model_input_image_size = model.image_size
+            print("Resizing to model input image size: ", model_input_image_size)
+            image = common_upscale(
+                image.movedim(-1, 1),
+                model_input_image_size,
+                model_input_image_size,
+                "bilinear",
+                "disabled",
+            ).movedim(1, -1)
+
+        try:
+            coordinates_positive = json.loads(coordinates_positive.replace("'", '"'))
+            coordinates_positive = [
+                (coord["x"], coord["y"]) for coord in coordinates_positive
+            ]
+            if coordinates_negative is not None:
+                coordinates_negative = json.loads(
+                    coordinates_negative.replace("'", '"')
+                )
+                coordinates_negative = [
+                    (coord["x"], coord["y"]) for coord in coordinates_negative
+                ]
+        except:
+            pass
+
+        positive_point_coords = np.array(coordinates_positive)
+        positive_point_labels = [1] * len(positive_point_coords)  # 1 = positive
+        positive_point_labels = np.array(positive_point_labels)
+        print("positive coordinates: ", positive_point_coords)
+
+        if coordinates_negative is not None:
+            negative_point_coords = np.array(coordinates_negative)
+            negative_point_labels = [0] * len(negative_point_coords)  # 0 = negative
+            negative_point_labels = np.array(negative_point_labels)
+            print("negative coordinates: ", negative_point_coords)
+
+            # Combine coordinates and labels
+        else:
+            negative_point_coords = np.empty((0, 2))
+            negative_point_labels = np.array([])
+        # Ensure both positive and negative coordinates are 2D arrays
+        positive_point_coords = np.atleast_2d(positive_point_coords)
+        negative_point_coords = np.atleast_2d(negative_point_coords)
+
+        # Ensure both positive and negative labels are 1D arrays
+        positive_point_labels = np.atleast_1d(positive_point_labels)
+        negative_point_labels = np.atleast_1d(negative_point_labels)
+
+        combined_coords = np.concatenate(
+            (positive_point_coords, negative_point_coords), axis=0
+        )
+        combined_labels = np.concatenate(
+            (positive_point_labels, negative_point_labels), axis=0
+        )
+
+        model.to(device)
+
+        autocast_condition = not mm.is_device_mps(device)
+        with (
+            torch.autocast(mm.get_autocast_device(model.device), dtype=dtype)
+            if autocast_condition
+            else nullcontext()
+        ):
+            if prev_inference_state is None:
+                print("Initializing inference state")
+                if hasattr(self, "inference_state"):
+                    model.reset_state(self.inference_state)
+                self.inference_state = model.init_state(
+                    image.permute(0, 3, 1, 2).contiguous(), H, W, device=device
+                )
+            else:
+                print("Using previous inference state")
+                B = prev_inference_state["num_frames"]
+                self.inference_state = prev_inference_state["inference_state"]
+            _, out_obj_ids, out_mask_logits = model.add_new_points(
+                inference_state=self.inference_state,
+                frame_idx=frame_index,
+                obj_id=object_index,
+                points=combined_coords,
+                labels=combined_labels,
+            )
+        inference_state = {
+            "inference_state": self.inference_state,
+            "num_frames": B,
+        }
+        sam2_model = {
+            "model": model,
+            "dtype": dtype,
+            "device": device,
+            "segmentor": segmentor,
+        }
+        return (
+            sam2_model,
+            inference_state,
+        )
+
+
+class Sam2VideoSegmentation:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "sam2_model": ("SAM2MODEL",),
+                "inference_state": ("SAM2INFERENCESTATE",),
+                "keep_model_loaded": ("BOOLEAN", {"default": True}),
+            },
+        }
+
+    RETURN_TYPES = ("MASK",)
+    RETURN_NAMES = ("mask",)
+    FUNCTION = "segment"
+    CATEGORY = "SAM2"
+
+    def segment(self, sam2_model, inference_state, keep_model_loaded):
+        offload_device = mm.unet_offload_device()
+        model = sam2_model["model"]
+        device = sam2_model["device"]
+        dtype = sam2_model["dtype"]
+        segmentor = sam2_model["segmentor"]
+        inference_state = inference_state["inference_state"]
+        B = inference_state["num_frames"]
+
+        if segmentor != "video":
+            raise ValueError("Loaded model is not SAM2Video")
+
+        model.to(device)
+
+        autocast_condition = not mm.is_device_mps(device)
+        with (
+            torch.autocast(mm.get_autocast_device(device), dtype=dtype)
+            if autocast_condition
+            else nullcontext()
+        ):
+
+            # if hasattr(self, 'inference_state'):
+            #    model.reset_state(self.inference_state)
+
+            pbar = ProgressBar(B)
+            video_segments = {}
+            for out_frame_idx, out_obj_ids, out_mask_logits in model.propagate_in_video(
+                inference_state
+            ):
+                print("out_mask_logits", out_mask_logits.shape)
+                _, _, H, W = out_mask_logits.shape
+                # Combine masks for all object IDs in the frame
+                combined_mask = np.zeros((H, W), dtype=np.uint8)
+                for i, out_obj_id in enumerate(out_obj_ids):
+                    out_mask = (out_mask_logits[i] > 0.0).cpu().numpy()
+                    combined_mask = np.logical_or(combined_mask, out_mask)
+                video_segments[out_frame_idx] = combined_mask
+                pbar.update(1)
+
+            mask_list = []
+            # Collect the combined masks
+            for frame_idx, combined_mask in video_segments.items():
+                mask_list.append(combined_mask)
+            print(f"Total masks collected: {len(mask_list)}")
+
+        if not keep_model_loaded:
             model.to(offload_device)
-            mm.soft_empty_cache()
-        
-        return (out_tensor, out_mask_tensor, out_results, out_data)
-     
+
+        out_list = []
+        for mask in mask_list:
+            mask_tensor = torch.from_numpy(mask)
+            mask_tensor = mask_tensor.permute(1, 2, 0)
+            mask_tensor = mask_tensor[:, :, 0]
+            out_list.append(mask_tensor)
+        mask_tensor = torch.stack(out_list, dim=0).cpu().float()
+        return (mask_tensor,)
+
+
+class Sam2AutoSegmentation:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "sam2_model": ("SAM2MODEL",),
+                "image": ("IMAGE",),
+                "points_per_side": ("INT", {"default": 32}),
+                "points_per_batch": ("INT", {"default": 64}),
+                "pred_iou_thresh": (
+                    "FLOAT",
+                    {"default": 0.8, "min": 0.0, "max": 1.0, "step": 0.01},
+                ),
+                "stability_score_thresh": (
+                    "FLOAT",
+                    {"default": 0.95, "min": 0.0, "max": 1.0, "step": 0.01},
+                ),
+                "stability_score_offset": (
+                    "FLOAT",
+                    {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01},
+                ),
+                "mask_threshold": (
+                    "FLOAT",
+                    {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.01},
+                ),
+                "crop_n_layers": ("INT", {"default": 0}),
+                "box_nms_thresh": (
+                    "FLOAT",
+                    {"default": 0.7, "min": 0.0, "max": 1.0, "step": 0.01},
+                ),
+                "crop_nms_thresh": (
+                    "FLOAT",
+                    {"default": 0.7, "min": 0.0, "max": 1.0, "step": 0.01},
+                ),
+                "crop_overlap_ratio": (
+                    "FLOAT",
+                    {"default": 0.34, "min": 0.0, "max": 1.0, "step": 0.01},
+                ),
+                "crop_n_points_downscale_factor": ("INT", {"default": 1}),
+                "min_mask_region_area": (
+                    "FLOAT",
+                    {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.01},
+                ),
+                "use_m2m": ("BOOLEAN", {"default": False}),
+                "keep_model_loaded": ("BOOLEAN", {"default": True}),
+            },
+        }
+
+    RETURN_TYPES = (
+        "MASK",
+        "IMAGE",
+        "BBOX",
+    )
+    RETURN_NAMES = (
+        "mask",
+        "segmented_image",
+        "bbox",
+    )
+    FUNCTION = "segment"
+    CATEGORY = "SAM2"
+
+    def segment(
+        self,
+        image,
+        sam2_model,
+        points_per_side,
+        points_per_batch,
+        pred_iou_thresh,
+        stability_score_thresh,
+        stability_score_offset,
+        crop_n_layers,
+        box_nms_thresh,
+        crop_n_points_downscale_factor,
+        min_mask_region_area,
+        use_m2m,
+        mask_threshold,
+        crop_nms_thresh,
+        crop_overlap_ratio,
+        keep_model_loaded,
+    ):
+        offload_device = mm.unet_offload_device()
+        model = sam2_model["model"]
+        device = sam2_model["device"]
+        dtype = sam2_model["dtype"]
+        segmentor = sam2_model["segmentor"]
+
+        if segmentor != "automaskgenerator":
+            raise ValueError("Loaded model is not SAM2AutomaticMaskGenerator")
+
+        model.points_per_side = points_per_side
+        model.points_per_batch = points_per_batch
+        model.pred_iou_thresh = pred_iou_thresh
+        model.stability_score_thresh = stability_score_thresh
+        model.stability_score_offset = stability_score_offset
+        model.crop_n_layers = crop_n_layers
+        model.box_nms_thresh = box_nms_thresh
+        model.crop_n_points_downscale_factor = crop_n_points_downscale_factor
+        model.crop_nms_thresh = crop_nms_thresh
+        model.crop_overlap_ratio = crop_overlap_ratio
+        model.min_mask_region_area = min_mask_region_area
+        model.use_m2m = use_m2m
+        model.mask_threshold = mask_threshold
+
+        model.predictor.model.to(device)
+
+        B, H, W, C = image.shape
+        image_np = (image.contiguous() * 255).byte().numpy()
+
+        out_list = []
+        segment_out_list = []
+        mask_list = []
+
+        pbar = ProgressBar(B)
+        autocast_condition = not mm.is_device_mps(device)
+        with (
+            torch.autocast(mm.get_autocast_device(device), dtype=dtype)
+            if autocast_condition
+            else nullcontext()
+        ):
+            for img_np in image_np:
+                result_dict = model.generate(img_np)
+                mask_list = [item["segmentation"] for item in result_dict]
+                bbox_list = [item["bbox"] for item in result_dict]
+
+                # Generate random colors for each mask
+                num_masks = len(mask_list)
+                colors = [
+                    tuple(random.choices(range(256), k=3)) for _ in range(num_masks)
+                ]
+
+                # Create a blank image to overlay masks
+                overlay_image = np.zeros((H, W, 3), dtype=np.uint8)
+
+                # Create a combined mask initialized to zeros
+                combined_mask = np.zeros((H, W), dtype=np.uint8)
+
+                # Iterate through masks and color them
+                for mask, color in zip(mask_list, colors):
+
+                    # Combine masks using logical OR
+                    combined_mask = np.logical_or(combined_mask, mask).astype(np.uint8)
+
+                    # Convert mask to numpy array
+                    mask_np = mask.astype(np.uint8)
+
+                    # Color the mask
+                    colored_mask = np.zeros_like(overlay_image)
+                    for i in range(3):  # Apply color channel-wise
+                        colored_mask[:, :, i] = mask_np * color[i]
+
+                    # Blend the colored mask with the overlay image
+                    overlay_image = np.where(
+                        colored_mask > 0, colored_mask, overlay_image
+                    )
+                out_list.append(torch.from_numpy(combined_mask))
+                segment_out_list.append(overlay_image)
+                pbar.update(1)
+
+        stacked_array = np.stack(segment_out_list, axis=0)
+        segment_image_tensor = torch.from_numpy(stacked_array).float() / 255
+
+        if not keep_model_loaded:
+            model.predictor.model.to(offload_device)
+
+        mask_tensor = torch.stack(out_list, dim=0)
+        return (
+            mask_tensor.cpu().float(),
+            segment_image_tensor.cpu().float(),
+            bbox_list,
+        )
+
+
+# WIP
+# class OwlV2Detector:
+#     @classmethod
+#     def INPUT_TYPES(s):
+#         return {
+#             "required": {
+#                 "image": ("IMAGE", ),
+#             },
+#         }
+
+#     RETURN_TYPES = ("MASK", )
+#     RETURN_NAMES =("mask", )
+#     FUNCTION = "segment"
+#     CATEGORY = "SAM2"
+
+#     def segment(self, image):
+#         from transformers import Owlv2Processor, Owlv2ForObjectDetection
+#         device = mm.get_torch_device()
+#         offload_device = mm.unet_offload_device()
+#         processor = Owlv2Processor.from_pretrained("google/owlv2-base-patch16-ensemble")
+#         model = Owlv2ForObjectDetection.from_pretrained("google/owlv2-base-patch16-ensemble")
+
+#         url = "http://images.cocodataset.org/val2017/000000039769.jpg"
+#         image = Image.open(requests.get(url, stream=True).raw)
+#         texts = [["a photo of a cat", "a photo of a dog"]]
+#         inputs = processor(text=texts, images=image, return_tensors="pt")
+#         outputs = model(**inputs)
+
+#         # Target image sizes (height, width) to rescale box predictions [batch_size, 2]
+#         target_sizes = torch.Tensor([image.size[::-1]])
+#         # Convert outputs (bounding boxes and class logits) to Pascal VOC Format (xmin, ymin, xmax, ymax)
+#         results = processor.post_process_object_detection(outputs=outputs, target_sizes=target_sizes, threshold=0.1)
+#         i = 0  # Retrieve predictions for the first image for the corresponding text queries
+#         text = texts[i]
+#         boxes, scores, labels = results[i]["boxes"], results[i]["scores"], results[i]["labels"]
+#         for box, score, label in zip(boxes, scores, labels):
+#             box = [round(i, 2) for i in box.tolist()]
+#             print(f"Detected {text[label]} with confidence {round(score.item(), 3)} at location {box}")
+
+
+#         return (mask_tensor,)
+
 NODE_CLASS_MAPPINGS = {
-    "DownloadAndLoadFlorence2Model": DownloadAndLoadFlorence2Model,
-    "DownloadAndLoadFlorence2Lora": DownloadAndLoadFlorence2Lora,
-    "Florence2ModelLoader": Florence2ModelLoader,
-    "Florence2Run": Florence2Run,
+    "DownloadAndLoadSAM2Model": DownloadAndLoadSAM2Model,
+    "Sam2Segmentation": Sam2Segmentation,
+    "Sam2SegmentationSeq": Sam2SegmentationSeq,
+    "Florence2toCoordinates": Florence2toCoordinates,
+    "Sam2AutoSegmentation": Sam2AutoSegmentation,
+    "Sam2VideoSegmentationAddPoints": Sam2VideoSegmentationAddPoints,
+    "Sam2VideoSegmentation": Sam2VideoSegmentation,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "DownloadAndLoadFlorence2Model": "DownloadAndLoadFlorence2Model",
-    "DownloadAndLoadFlorence2Lora": "DownloadAndLoadFlorence2Lora",
-    "Florence2ModelLoader": "Florence2ModelLoader",
-    "Florence2Run": "Florence2Run",
+    "DownloadAndLoadSAM2Model": "(Down)Load SAM2Model",
+    "Sam2Segmentation": "Sam2Segmentation",
+    "Sam2SegmentationSeq": "Sam2SegmentationSeq",
+    "Florence2toCoordinates": "Florence2 Coordinates",
+    "Sam2AutoSegmentation": "Sam2AutoSegmentation",
+    "Sam2VideoSegmentationAddPoints": "Sam2VideoSegmentationAddPoints",
+    "Sam2VideoSegmentation": "Sam2VideoSegmentation",
 }
